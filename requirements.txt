@@ -1,0 +1,11 @@
+streamlit
+google-generativeai
+matplotlib
+python-docx
+streamlit-mic-recorder
+SpeechRecognition
+edge-tts
+yfinance
+pandas
+requests
+pillow
