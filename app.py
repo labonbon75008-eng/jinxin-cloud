@@ -15,11 +15,11 @@ from datetime import datetime, timedelta
 from streamlit_mic_recorder import mic_recorder
 import speech_recognition as sr
 import asyncio
-import edge_tts  # 云端语音库
+import edge_tts
 import requests
 import pandas as pd
 import warnings
-import contextlib # 【已修复】补回漏掉的库
+import contextlib
 import sys
 import yfinance as yf
 from PIL import Image
@@ -27,10 +27,7 @@ from PIL import Image
 # ================= 1. 云端环境配置 =================
 warnings.filterwarnings("ignore")
 
-# ⚠️ 云端通常不需要代理，已移除 PROXY 设置
-# 如果你在本地运行此版本且需要翻墙，请自行恢复 os.environ 设置
-
-# API KEY (建议在 Streamlit Secrets 中配置，这里做兼容)
+# ⚠️ 云端无代理模式
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except:
@@ -43,37 +40,45 @@ AUDIO_DIR = "audio_cache"
 for d in [CHARTS_DIR, AUDIO_DIR]:
     if not os.path.exists(d): os.makedirs(d)
 
-# 【UI修复】页面图标尝试使用本地图片（如果不支持则用 Emoji）
 st.set_page_config(page_title="金鑫 - 云端私人顾问", page_icon="👩‍💼", layout="wide")
 
 # ================= 2. UI 美化 =================
 st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
-    div[data-testid="stSidebar"] div[data-testid="stImage"] img {
-        width: 100%; max-width: 100%; object-fit: cover; border-radius: 12px;
+    
+    /* 侧边栏头像圆形化 */
+    div[data-testid="stSidebar"] img {
+        border-radius: 50%;
+        border: 2px solid #4CAF50;
     }
+    
+    /* 隐藏顶部默认头像，只显示我们自定义的 */
+    div[data-testid="stHeader"] { display: none; }
+    
     .stChatMessage { background-color: rgba(255, 255, 255, 0.05); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
     mark { background-color: #ffeb3b; color: #000000 !important; border-radius: 4px; padding: 0.2em; font-weight: bold; }
     .current-match { border: 2px solid #ff4b4b; padding: 10px; border-radius: 10px; background-color: rgba(255, 75, 75, 0.05); display: block; }
     .code-output { background-color: #e8f5e9; color: #000000 !important; padding: 15px; border-radius: 8px; border-left: 6px solid #2e7d32; font-family: 'Consolas', monospace; margin-bottom: 10px; font-size: 0.95em; }
     .monitor-box { border: 2px solid #ff5722; background-color: #fff3e0; padding: 10px; border-radius: 10px; text-align: center; color: #d84315; font-weight: bold; font-size: 0.9em; margin-bottom: 10px; }
+    
+    /* 按钮紧凑 */
+    div[data-testid="stButton"] button { white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; }
 </style>
 """, unsafe_allow_html=True)
 
 # ================= 3. 核心功能函数 =================
 
 def load_avatar(filename, default_emoji):
-    """加载本地头像"""
     extensions = ["png", "jpg", "jpeg"]
     base_name = filename.split('.')[0]
     for ext in extensions:
         path = f"{base_name}.{ext}"
         if os.path.exists(path):
-            return path # 返回路径
-    return default_emoji # 找不到文件则返回 Emoji
+            return path
+    return default_emoji
 
-# --- 数据抓取 (云端策略：优先 Yahoo) ---
+# --- 数据抓取 (云端策略) ---
 def fix_stock_symbol(symbol):
     s = symbol.strip().upper()
     if s.isdigit():
@@ -84,49 +89,37 @@ def fix_stock_symbol(symbol):
     return s
 
 def get_stock_data_cloud(ticker_symbol):
-    """云端数据抓取：主要依赖 yfinance"""
     symbol = fix_stock_symbol(ticker_symbol)
     df = None
     info_str = "暂无数据"
-    
     try:
         ticker = yf.Ticker(symbol)
-        # 获取最近5天数据
         hist = ticker.history(period="5d", interval="1d")
-        
         if not hist.empty:
             df = hist[['Close']]
             last_price = df['Close'].iloc[-1]
             last_date = df.index[-1].strftime("%Y-%m-%d")
             currency = ticker.info.get('currency', '?')
-            
-            # 尝试计算涨跌
             change_str = ""
             if len(df) >= 2:
                 prev = df['Close'].iloc[-2]
                 change = last_price - prev
                 pct = (change / prev) * 100
                 change_str = f" ({'+' if change>0 else ''}{change:.2f} / {pct:.2f}%)"
-            
             info_str = f"日期: {last_date} | 最新价: {last_price:.2f} {currency}{change_str}"
             return df, info_str
-    except Exception as e:
-        print(f"Yahoo Error: {e}")
+    except Exception as e: print(f"Yahoo Error: {e}")
+    return None, f"无法获取 {symbol} 数据，请检查代码"
 
-    return None, f"数据获取失败 ({symbol})，请检查代码或网络"
-
-# --- 语音合成 (Edge-TTS) ---
+# --- 语音合成 ---
 async def generate_audio_edge(text, output_file):
-    """微软 Edge 语音 (云端核心)"""
     try:
-        # 使用晓晓 (Xiaoxiao) - 知性女声
         communicate = edge_tts.Communicate(text, "zh-CN-XiaoxiaoNeural")
         await communicate.save(output_file)
         return True
     except: return False
 
 def save_audio_cloud(text, output_path):
-    """同步包装器"""
     try:
         asyncio.run(generate_audio_edge(text, output_path))
         return True
@@ -149,14 +142,14 @@ def get_spoken_response(text_analysis):
         return response.text
     except: return ""
 
-# --- 系统配置 ---
+# --- 模型配置 ---
 current_time_str = datetime.now().strftime("%Y年%m月%d日")
 SYSTEM_INSTRUCTION = f"""
 你叫“金鑫”，用户的专属私人财富合伙人。当前日期：{current_time_str}。
 
 【能力】
 查询价格时，请编写代码调用 `get_stock_data_cloud(ticker)`。
-A股代码直接写数字 (如 600309)，美股直接写代码 (如 AAPL)。
+A股代码直接写数字 (如 600309)。
 
 【代码模板】
 ticker = "300750" # 宁德时代
@@ -177,7 +170,7 @@ def get_model():
     genai.configure(api_key=API_KEY)
     return genai.GenerativeModel(model_name="gemini-3-pro-preview", system_instruction=SYSTEM_INSTRUCTION)
 
-# --- 基础 CRUD ---
+# --- 基础 CRUD (保留完整功能) ---
 def load_memory():
     if os.path.exists(MEMORY_FILE):
         try:
@@ -250,22 +243,19 @@ if "last_search_query" not in st.session_state: st.session_state.last_search_que
 if "trigger_scroll" not in st.session_state: st.session_state.trigger_scroll = False
 if "monitor_active" not in st.session_state: st.session_state.monitor_active = False
 
-# --- 侧边栏 (功能全回归) ---
+# --- 侧边栏 ---
 with st.sidebar:
-    # 1. 头像逻辑
     user_avatar = load_avatar("user", "👨‍💼")
     ai_avatar = load_avatar("avatar", "👩‍💼")
     
-    # 金鑫头像展示
+    # 强制只显示自定义头像
     c_av1, c_av2, c_av3 = st.columns([1, 2, 1])
     with c_av2:
-        if os.path.exists(ai_avatar) and ai_avatar != "👩‍💼": 
-            st.image(ai_avatar, use_container_width=True)
-        else: 
-            st.markdown("<div style='text-align: center; font-size: 60px;'>👩‍💼</div>", unsafe_allow_html=True)
-    st.markdown("<h3 style='text-align: center;'>金鑫 - 云端合伙人</h3>", unsafe_allow_html=True)
+        if os.path.exists("avatar.png"): st.image("avatar.png", use_container_width=True)
+        else: st.markdown("<div style='text-align: center; font-size: 60px;'>👩‍💼</div>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center;'>金鑫 - 云端版</h3>", unsafe_allow_html=True)
 
-    # 2. 盯盘雷达 (回归!)
+    # 1. 盯盘 (回归!)
     with st.expander("🎯 价格雷达 (盯盘)", expanded=False):
         monitor_ticker = st.text_input("代码", value="300750", placeholder="如 300750")
         c_m1, c_m2 = st.columns(2)
@@ -278,7 +268,6 @@ with st.sidebar:
             
         if st.session_state.monitor_active:
             st.markdown("<div class='monitor-box'>📡 扫描中...</div>", unsafe_allow_html=True)
-            # 云端盯盘逻辑
             df_m, info_m = get_stock_data_cloud(monitor_ticker)
             if df_m is not None:
                 curr = df_m['Close'].iloc[-1]
@@ -291,13 +280,13 @@ with st.sidebar:
                 if triggered:
                     msg = f"注意！{monitor_ticker} 现价 {curr:.2f} 触发目标！"
                     st.error(msg)
-                    st.session_state.monitor_active = False # 触发即停
+                    st.session_state.monitor_active = False
             else:
                 st.warning("获取失败")
 
     st.divider()
     
-    # 3. 搜索 (回归!)
+    # 2. 搜索 (回归!)
     search_query = st.text_input("🔍 搜索", placeholder="关键词...", label_visibility="collapsed")
     match_indices = [i for i, m in enumerate(st.session_state.messages) if not m.get("hidden", False) and search_query and search_query in m["content"]]
     if search_query != st.session_state.last_search_query:
@@ -316,7 +305,7 @@ with st.sidebar:
 
     st.divider()
     
-    # 4. 导出与清空 (回归!)
+    # 3. 导出与清空 (回归!)
     c_btn1, c_btn2 = st.columns(2)
     if c_btn1.button("🗑️ 清空", type="primary", use_container_width=True):
         st.session_state.messages = []; st.session_state.chat_session = None
@@ -334,13 +323,12 @@ st.markdown("<h2 style='text-align: center;'>👩‍💼 金鑫：云端财富�
 
 for i, msg in enumerate(st.session_state.messages):
     if msg.get("hidden", False): continue
+    
+    # 锚点
     st.markdown(f"<div id='{msg['id']}'></div>", unsafe_allow_html=True)
-    
     is_curr = search_query and match_indices and i == match_indices[st.session_state.search_idx]
-    
-    # 头像逻辑：优先用图片
+
     current_avatar = ai_avatar if msg["role"] == "assistant" else user_avatar
-    # 再次确认文件存在，否则用 emoji
     if current_avatar != "👩‍💼" and current_avatar != "👨‍💼" and not os.path.exists(current_avatar):
         current_avatar = "👩‍💼" if msg["role"] == "assistant" else "👨‍💼"
 
@@ -357,6 +345,13 @@ for i, msg in enumerate(st.session_state.messages):
         
         if msg.get("image_path") and os.path.exists(msg["image_path"]): st.image(msg["image_path"])
         if msg.get("audio_path") and os.path.exists(msg.get("audio_path")): st.audio(msg["audio_path"], format="audio/wav")
+        
+        # 【功能回归】操作菜单
+        with st.expander("🛠️ 更多操作", expanded=False):
+            c1, c2, c3 = st.columns([1,1,3])
+            if c1.button("🚫 隐藏", key=f"h_{msg['id']}"): toggle_hidden(msg["id"])
+            if c2.button("🗑️ 删除", key=f"d_{msg['id']}"): delete_message(msg["id"])
+            st.code(clean, language="text")
 
 u_in_text = st.chat_input("请问金鑫...")
 u_in = None
@@ -391,7 +386,6 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
             try:
                 spoken = get_spoken_response(txt)
                 ap = os.path.join(AUDIO_DIR, f"v_{int(time.time())}.wav")
-                # 云端语音生成
                 if save_audio_cloud(spoken, ap): st.audio(ap, format="audio/wav"); af = ap
             except: pass
         st.session_state.messages.append({"id": str(uuid.uuid4()), "role": "assistant", "content": txt, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "hidden": False, "image_path": img, "audio_path": af, "code_output": out})
