@@ -19,20 +19,20 @@ import edge_tts
 import requests
 import pandas as pd
 import warnings
-import contextlib # ✅ 已修复：补回漏掉的库
+import contextlib
 import sys
 import yfinance as yf
 from PIL import Image
+import random
 
 # ================= 1. 云端环境配置 =================
 warnings.filterwarnings("ignore")
 
-# ✅ 修复：优先从 Secrets 读取 Key，防止泄露
+# API KEY 配置 (优先 Secrets)
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except:
-    # 如果没配置 Secrets，为了防止报错，提示用户
-    st.error("请在 Streamlit Settings -> Secrets 中配置 GEMINI_API_KEY")
+    st.error("❌ 未检测到 API Key，请在 Streamlit Secrets 中配置 GEMINI_API_KEY")
     st.stop()
 
 MEMORY_FILE = "investment_memory_cloud.json"
@@ -49,68 +49,129 @@ st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
     
-    /* 侧边栏头像美化 */
+    /* 头像样式增强 */
     div[data-testid="stSidebar"] img {
-        border-radius: 15px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
+        border-radius: 50%;
+        border: 3px solid #4CAF50;
+        box-shadow: 0 4px 10px rgba(0,0,0,0.5);
+        object-fit: cover;
     }
     
     /* 顶部标题区头像 */
-    .header-avatar img {
-        border-radius: 50%;
-        border: 3px solid #4CAF50;
+    div[data-testid="stImage"] img {
+        border-radius: 12px;
     }
 
     .stChatMessage { background-color: rgba(255, 255, 255, 0.05); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
     mark { background-color: #ffeb3b; color: #000000 !important; border-radius: 4px; padding: 0.2em; font-weight: bold; }
     .code-output { background-color: #e8f5e9; color: #000000 !important; padding: 15px; border-radius: 8px; border-left: 6px solid #2e7d32; font-family: 'Consolas', monospace; margin-bottom: 10px; font-size: 0.95em; }
     .monitor-box { border: 2px solid #ff5722; background-color: #fff3e0; padding: 10px; border-radius: 10px; text-align: center; color: #d84315; font-weight: bold; font-size: 0.9em; margin-bottom: 10px; }
+    
+    div[data-testid="stButton"] button { white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; }
 </style>
 """, unsafe_allow_html=True)
 
 # ================= 3. 核心功能函数 =================
 
-def load_avatar(filename, default_emoji):
-    extensions = ["png", "jpg", "jpeg"]
-    base_name = filename.split('.')[0]
+# --- 图片智能加载 (修复白块问题) ---
+def get_avatar_path(base_name):
+    """
+    智能查找图片路径 (解决Linux大小写敏感问题)
+    """
+    # 穷举所有可能的后缀组合
+    extensions = ["png", "PNG", "jpg", "JPG", "jpeg", "JPEG"]
+    
+    # 1. 先找 base_name (比如 'avatar')
     for ext in extensions:
         path = f"{base_name}.{ext}"
-        if os.path.exists(path):
-            return path
-    return default_emoji
+        if os.path.exists(path): return path
+        
+    # 2. 如果没找到，尝试首字母大写 (比如 'Avatar')
+    for ext in extensions:
+        path = f"{base_name.capitalize()}.{ext}"
+        if os.path.exists(path): return path
+        
+    return None
 
-# --- 数据抓取 (云端策略) ---
-def fix_stock_symbol(symbol):
-    s = symbol.strip().upper()
+# --- 数据抓取 (新浪源救场) ---
+def get_sina_code(symbol):
+    """代码转换：通用 -> 新浪格式"""
+    s = symbol.strip().upper().replace(".SS", "").replace(".SZ", "").replace(".HK", "")
     if s.isdigit():
-        if s.startswith('6'): return f"{s}.SS"
-        if s.startswith('0') or s.startswith('3'): return f"{s}.SZ"
-        if len(s) == 5: return f"{s}.HK"
-        if len(s) == 4: return f"0{s}.HK"
-    return s
+        if len(s) == 5: return f"hk{s}" 
+        if len(s) == 4: return f"hk0{s}" 
+        if len(s) == 6:
+            if s.startswith('6'): return f"sh{s}"
+            if s.startswith('0') or s.startswith('3'): return f"sz{s}"
+            if s.startswith('8') or s.startswith('4'): return f"bj{s}"
+    return f"sh{s}" if s.isdigit() else s
 
 def get_stock_data_cloud(ticker_symbol):
-    symbol = fix_stock_symbol(ticker_symbol)
-    df = None
+    """
+    云端数据抓取策略：
+    1. 优先用新浪接口 (hq.sinajs.cn) 获取实时价格，因为它不限流且速度极快。
+    2. 如果需要历史数据画图，再尝试 Yahoo，但也加了重试机制。
+    """
+    sina_code = get_sina_code(ticker_symbol)
+    
+    # --- 步骤 1: 获取实时数据 (新浪) ---
     info_str = "暂无数据"
+    current_price = 0.0
+    
     try:
-        ticker = yf.Ticker(symbol)
+        url = f"http://hq.sinajs.cn/list={sina_code}"
+        # 伪装 Headers
+        headers = {'Referer': 'https://finance.sina.com.cn'}
+        r = requests.get(url, headers=headers, timeout=2)
+        
+        if '=""' not in r.text and len(r.text) > 20:
+            parts = r.text.split('"')[1].split(',')
+            name = parts[0]
+            current_price = float(parts[3])
+            prev_close = float(parts[2])
+            
+            # 计算涨跌
+            change = current_price - prev_close
+            pct = (change / prev_close) * 100 if prev_close != 0 else 0
+            
+            # 格式化日期
+            date_str = parts[30] + " " + parts[31] if len(parts) > 30 else datetime.now().strftime("%Y-%m-%d")
+            
+            info_str = f"【{name}】 现价: {current_price:.2f} ({pct:+.2f}%) | 时间: {date_str}"
+    except Exception as e:
+        print(f"Sina Error: {e}")
+
+    # --- 步骤 2: 获取历史数据画图 (Yahoo) ---
+    # 如果新浪成功拿到了名字，我们还是尝试用 Yahoo 画个图，但如果不通也无所谓，至少有报价了
+    df = None
+    try:
+        # Yahoo 代码转换
+        y_sym = ticker_symbol
+        if y_sym.isdigit():
+            if y_sym.startswith('6'): y_sym += ".SS"
+            elif y_sym.startswith('0') or y_sym.startswith('3'): y_sym += ".SZ"
+            elif len(y_sym) == 5: y_sym += ".HK"
+        
+        # 尝试获取 (带 User-Agent 防止 429)
+        session = requests.Session()
+        session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'})
+        
+        ticker = yf.Ticker(y_sym, session=session)
         hist = ticker.history(period="5d", interval="1d")
+        
         if not hist.empty:
             df = hist[['Close']]
-            last_price = df['Close'].iloc[-1]
-            last_date = df.index[-1].strftime("%Y-%m-%d")
-            currency = ticker.info.get('currency', '?')
-            change_str = ""
-            if len(df) >= 2:
-                prev = df['Close'].iloc[-2]
-                change = last_price - prev
-                pct = (change / prev) * 100
-                change_str = f" ({'+' if change>0 else ''}{change:.2f} / {pct:.2f}%)"
-            info_str = f"日期: {last_date} | 最新价: {last_price:.2f} {currency}{change_str}"
-            return df, info_str
-    except Exception as e: print(f"Yahoo Error: {e}")
-    return None, f"无法获取 {symbol} 数据"
+            # 如果新浪没拿到数据，用 Yahoo 的补救
+            if current_price == 0:
+                last = df['Close'].iloc[-1]
+                info_str = f"【Yahoo数据】 收盘价: {last:.2f} (新浪接口暂不可用)"
+    except:
+        pass # 画图失败不影响报价
+
+    if current_price != 0 or df is not None:
+        return df, info_str
+    
+    return None, f"数据全线获取失败 ({ticker_symbol})，请检查代码是否正确"
 
 # --- 语音合成 ---
 async def generate_audio_edge(text, output_file):
@@ -157,7 +218,7 @@ ticker = "300750" # 宁德时代
 df, info = get_stock_data_cloud(ticker)
 
 if df is not None:
-    print(f"【金鑫云端实盘】{{info}}") 
+    print(info)  # 直接打印 info 字符串即可
     plt.figure(figsize=(10, 5))
     plt.plot(df.index, df['Close'], label='Close', color='#c2185b') 
     plt.title(f"{{ticker}} Trend")
@@ -244,19 +305,25 @@ if "last_search_query" not in st.session_state: st.session_state.last_search_que
 if "trigger_scroll" not in st.session_state: st.session_state.trigger_scroll = False
 if "monitor_active" not in st.session_state: st.session_state.monitor_active = False
 
-# 头像逻辑
-user_avatar = load_avatar("user", "👨‍💼")
-ai_avatar = load_avatar("avatar", "👩‍💼")
+# 智能加载头像 (不区分大小写)
+ai_avatar = get_avatar_path("avatar") 
+user_avatar = get_avatar_path("user")
+
+# 默认网络备用图
+DEFAULT_AI_URL = "https://api.dicebear.com/9.x/avataaars/svg?seed=Jinxin&clothing=blazerAndShirt&hairColor=black&top=longHairStraight"
 
 # --- 侧边栏 ---
 with st.sidebar:
-    if os.path.exists(ai_avatar) and ai_avatar != "👩‍💼": 
-        st.image(ai_avatar, use_container_width=True)
-    else: 
-        st.markdown("<div style='text-align: center; font-size: 60px;'>👩‍💼</div>", unsafe_allow_html=True)
-    st.markdown("<h3 style='text-align: center;'>金鑫 - 云端合伙人</h3>", unsafe_allow_html=True)
+    # 头像显示区
+    if ai_avatar:
+        st.image(ai_avatar, use_container_width=True, caption="👩‍💼 金鑫 - 高级合伙人")
+    else:
+        st.image(DEFAULT_AI_URL, use_container_width=True, caption="👩‍💼 金鑫 (默认)")
+        st.warning("⚠️ 未检测到 avatar.png，请检查 GitHub 文件名是否正确 (区分大小写)。")
 
-    # 1. 盯盘 (功能回归)
+    st.markdown("---")
+
+    # 1. 盯盘
     with st.expander("🎯 价格雷达 (盯盘)", expanded=False):
         monitor_ticker = st.text_input("代码", value="300750", placeholder="如 300750")
         c_m1, c_m2 = st.columns(2)
@@ -264,140 +331,4 @@ with st.sidebar:
         monitor_type = c_m2.selectbox("条件", ["跌破", "突破"])
         
         if st.button("🔴 启动" if not st.session_state.monitor_active else "⏹️ 停止", type="primary" if not st.session_state.monitor_active else "secondary"):
-            st.session_state.monitor_active = not st.session_state.monitor_active
-            st.rerun()
-            
-        if st.session_state.monitor_active:
-            st.markdown("<div class='monitor-box'>📡 扫描中...</div>", unsafe_allow_html=True)
-            df_m, info_m = get_stock_data_cloud(monitor_ticker)
-            if df_m is not None:
-                curr = df_m['Close'].iloc[-1]
-                st.metric("实时价", f"{curr:.2f}")
-                triggered = False
-                if monitor_type == "跌破" and curr < monitor_target: triggered = True
-                if monitor_type == "突破" and curr > monitor_target: triggered = True
-                if triggered:
-                    msg = f"注意！{monitor_ticker} 现价 {curr:.2f} 触发目标！"
-                    st.error(msg)
-                    st.session_state.monitor_active = False 
-            else:
-                st.warning("获取失败")
-
-    st.divider()
-    
-    # 2. 搜索 (功能回归)
-    search_query = st.text_input("🔍 搜索", placeholder="关键词...", label_visibility="collapsed")
-    match_indices = [i for i, m in enumerate(st.session_state.messages) if not m.get("hidden", False) and search_query and search_query in m["content"]]
-    if search_query != st.session_state.last_search_query:
-        st.session_state.search_idx = 0; st.session_state.last_search_query = search_query; st.session_state.trigger_scroll = True
-
-    if match_indices:
-        c1, c2, c3 = st.columns([1, 2, 1])
-        if c1.button("🔼"): st.session_state.search_idx = (st.session_state.search_idx - 1) % len(match_indices); st.session_state.trigger_scroll = True; st.rerun()
-        if c3.button("🔽"): st.session_state.search_idx = (st.session_state.search_idx + 1) % len(match_indices); st.session_state.trigger_scroll = True; st.rerun()
-        c2.markdown(f"<div style='text-align:center; padding-top:5px;'>{st.session_state.search_idx + 1}/{len(match_indices)}</div>", unsafe_allow_html=True)
-        if st.session_state.trigger_scroll:
-            tid = st.session_state.messages[match_indices[st.session_state.search_idx]]["id"]
-            import streamlit.components.v1 as components
-            components.html(f"<script>setTimeout(function(){{var e=window.parent.document.getElementById('{tid}');if(e)e.scrollIntoView({{behavior:'smooth',block:'center'}});}}, 500);</script>", height=0)
-            st.session_state.trigger_scroll = False
-
-    st.divider()
-    
-    # 3. 导出与清空 (功能回归)
-    c_btn1, c_btn2 = st.columns(2)
-    if c_btn1.button("🗑️ 清空", type="primary", use_container_width=True):
-        st.session_state.messages = []; st.session_state.chat_session = None
-        if os.path.exists(MEMORY_FILE): os.remove(MEMORY_FILE)
-        st.rerun()
-    
-    doc = create_word_doc(st.session_state.messages)
-    c_btn2.download_button("📥 导出", doc, "报告.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
-    
-    st.divider()
-    text_voice = mic_recorder(start_prompt="🎙️ 语音", stop_prompt="⏹️ 停止", key='rec', format="wav", use_container_width=True)
-
-# --- 主界面 ---
-# ✅ 修复：头部显示金鑫头像，而非丑表情
-c_head1, c_head2 = st.columns([1, 6])
-with c_head1:
-    if os.path.exists(ai_avatar) and ai_avatar != "👩‍💼":
-        st.image(ai_avatar, width=80)
-    else:
-        st.markdown("## 👩‍💼")
-with c_head2:
-    st.markdown("## 金鑫：云端财富合伙人")
-
-for i, msg in enumerate(st.session_state.messages):
-    if msg.get("hidden", False): continue
-    
-    # 锚点
-    st.markdown(f"<div id='{msg['id']}'></div>", unsafe_allow_html=True)
-    is_curr = search_query and match_indices and i == match_indices[st.session_state.search_idx]
-
-    current_avatar = ai_avatar if msg["role"] == "assistant" else user_avatar
-    if current_avatar != "👩‍💼" and current_avatar != "👨‍💼" and not os.path.exists(current_avatar):
-        current_avatar = "👩‍💼" if msg["role"] == "assistant" else "👨‍💼"
-
-    with st.chat_message(msg["role"], avatar=current_avatar):
-        st.caption(f"{msg.get('timestamp','')} {'| 📍' if is_curr else ''}")
-        if msg.get("code_output"):
-            st.markdown(f"<div class='code-output'>{msg['code_output']}</div>", unsafe_allow_html=True)
-        
-        content = msg["content"]
-        if search_query: content = re.compile(re.escape(search_query), re.IGNORECASE).sub(lambda m: f"<mark>{m.group()}</mark>", content)
-        clean = re.sub(r'```python.*?```', '', content, flags=re.DOTALL)
-        if is_curr: st.markdown(f"<div class='current-match'>{clean}</div>", unsafe_allow_html=True)
-        else: st.markdown(clean, unsafe_allow_html=True)
-        
-        if msg.get("image_path") and os.path.exists(msg["image_path"]): st.image(msg["image_path"])
-        if msg.get("audio_path") and os.path.exists(msg.get("audio_path")): st.audio(msg["audio_path"], format="audio/wav")
-        
-        # ✅ 修复：操作按钮回归
-        with st.expander("🛠️ 更多操作", expanded=False):
-            c1, c2, c3 = st.columns([1,1,3])
-            if c1.button("🚫 隐藏", key=f"h_{msg['id']}"): toggle_hidden(msg["id"])
-            if c2.button("🗑️ 删除", key=f"d_{msg['id']}"): delete_message(msg["id"])
-            st.code(clean, language="text")
-
-u_in_text = st.chat_input("请问金鑫...")
-u_in = None
-if text_voice and text_voice['bytes']:
-    t = transcribe_audio(text_voice['bytes'])
-    if t: u_in = t
-elif u_in_text: u_in = u_in_text
-
-if u_in:
-    st.session_state.messages.append({"id": str(uuid.uuid4()), "role": "user", "content": u_in, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "hidden": False})
-    save_memory(st.session_state.messages)
-    st.rerun()
-
-if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-    last = st.session_state.messages[-1]
-    with st.chat_message("assistant", avatar=ai_avatar if os.path.exists(ai_avatar) else "👩‍💼"):
-        ph = st.empty(); img = None; out = None; txt = ""
-        if st.session_state.chat_session:
-            with st.spinner("☁️ 云端运算中..."):
-                try:
-                    resp = st.session_state.chat_session.send_message(last["content"])
-                    txt = resp.text
-                    codes = re.findall(r'```python(.*?)```', txt, re.DOTALL)
-                    if codes: img, out = execute_local_code_and_save(codes[-1])
-                    if out: st.markdown(f"<div class='code-output'>{out}</div>", unsafe_allow_html=True)
-                    clean = re.sub(r'```python.*?```', '', txt, flags=re.DOTALL)
-                    ph.markdown(clean)
-                    if img: st.image(img)
-                except Exception as e: st.error(f"Error: {e}")
-        af = None
-        if "异常" not in (out or ""):
-            try:
-                spoken = get_spoken_response(txt)
-                ap = os.path.join(AUDIO_DIR, f"v_{int(time.time())}.wav")
-                if save_audio_cloud(spoken, ap): st.audio(ap, format="audio/wav"); af = ap
-            except: pass
-        st.session_state.messages.append({"id": str(uuid.uuid4()), "role": "assistant", "content": txt, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "hidden": False, "image_path": img, "audio_path": af, "code_output": out})
-        save_memory(st.session_state.messages)
-
-if st.session_state.monitor_active:
-    time.sleep(5)
-    st.rerun()
+            st.session_state.monitor_active = not st.session_state
