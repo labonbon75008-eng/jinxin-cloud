@@ -10,7 +10,7 @@ import warnings
 import asyncio
 from datetime import datetime, timedelta
 
-# ================= 1. 启动配置 (必须在第一行) =================
+# ================= 1. 启动配置 =================
 st.set_page_config(page_title="金鑫 - 智能财富合伙人", page_icon="👩‍💼", layout="wide")
 warnings.filterwarnings("ignore")
 
@@ -40,17 +40,14 @@ MEMORY_FILE = "investment_memory_cloud.json"
 CHARTS_DIR = "charts"
 AUDIO_DIR = "audio_cache"
 
-# 【核心修复】防止文件已存在报错
 for d in [CHARTS_DIR, AUDIO_DIR]:
-    try:
-        os.makedirs(d, exist_ok=True)
+    try: os.makedirs(d, exist_ok=True)
     except: pass
 
 # API KEY
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except:
-    # 备用 Key，防止黑屏
     API_KEY = "AIzaSyAaN5lJUzp7MXQuLyi8NMV5V26aizR8kBU"
 
 # ================= 4. 核心功能函数 =================
@@ -62,39 +59,73 @@ def load_avatar(filename):
         if os.path.exists(p): return p
     return None
 
-def get_stock_data_v10(ticker_symbol):
-    """数据引擎"""
+def get_stock_data_v11(ticker_symbol):
+    """V11 数据引擎：增强港股识别"""
     s = ticker_symbol.strip().upper().replace(".SS","").replace(".SZ","").replace(".HK","")
+    
+    # 智能识别后缀
+    sina_code = ""
+    y_sym = ""
+    
     if s.isdigit():
-        if len(s)==5: sina=f"hk{s}"; y_s=f"{s}.HK"
-        elif len(s)==4: sina=f"hk0{s}"; y_s=f"0{s}.HK"
-        elif s.startswith('6'): sina=f"sh{s}"; y_s=f"{s}.SS"
-        else: sina=f"sz{s}"; y_s=f"{s}.SZ"
-    else: sina=f"sh{s}"; y_s=s
+        if len(s) == 3: # 输入 700 -> 00700
+            sina_code = f"hk00{s}"
+            y_sym = f"00{s}.HK"
+        elif len(s) == 5: # 00700
+            sina_code = f"hk{s}"
+            y_sym = f"{s}.HK"
+        elif len(s) == 4:
+            sina_code = f"hk0{s}"
+            y_sym = f"0{s}.HK"
+        elif s.startswith('6'):
+            sina_code = f"sh{s}"
+            y_sym = f"{s}.SS"
+        elif s.startswith('0') or s.startswith('3'):
+            sina_code = f"sz{s}"
+            y_sym = f"{s}.SZ"
+        elif s.startswith('8') or s.startswith('4'):
+            sina_code = f"bj{s}"
+            y_sym = f"{s}.SS" # 临时处理
+    else:
+        # 美股
+        sina_code = f"gb_{s.lower()}"
+        y_sym = s
 
     info = "暂无数据"; price = 0.0
     
-    # 1. Sina
+    # 1. Sina (极速)
     try:
-        url = f"http://hq.sinajs.cn/list={sina}"
+        url = f"http://hq.sinajs.cn/list={sina_code}"
         r = requests.get(url, timeout=2, proxies={"http":None,"https":None})
+        # 港股返回格式略有不同，做个兼容
         if len(r.text) > 20:
-            p = r.text.split('"')[1].split(',')
-            name, curr, prev = p[0], float(p[3]), float(p[2])
+            content = r.text.split('"')[1]
+            parts = content.split(',')
+            
+            if "hk" in sina_code: # 港股格式
+                # 英文名, 英文名, 开盘, 昨收, 最高, 最低, 当前...
+                name = parts[1]
+                curr = float(parts[6])
+                prev = float(parts[3])
+            else: # A股格式
+                name = parts[0]
+                curr = float(parts[3])
+                prev = float(parts[2])
+                
             pct = ((curr-prev)/prev)*100 if prev!=0 else 0
-            info = f"【{name}】 {curr:.2f} ({pct:+.2f}%)"
+            info = f"【{name}】 现价: {curr:.2f} ({pct:+.2f}%)"
             price = curr
     except: pass
 
-    # 2. Yahoo Chart
+    # 2. Yahoo Chart (画图)
     df = None
     try:
-        tk = yf.Ticker(y_s)
+        tk = yf.Ticker(y_sym)
         hist = tk.history(period="1mo")
         if not hist.empty: df = hist[['Close']]
     except: pass
 
-    # 3. 兜底
+    # 3. 兜底画图 (防止无图报错)
     if df is None and price > 0:
         df = pd.DataFrame({'Close': [price]*5}, index=pd.date_range(end=datetime.now(), periods=5))
     
@@ -118,16 +149,37 @@ def transcribe(bytes_data):
             return r.recognize_google(r.record(source), language='zh-CN')
     except: return None
 
-# --- AI ---
+# --- AI (核心修正：严禁 seaborn) ---
 @st.cache_resource
 def get_model():
     genai.configure(api_key=API_KEY)
-    sys_prompt = f"你是金鑫，私人财富顾问。当前日期:{datetime.now().strftime('%Y-%m-%d')}。查股价用`get_stock_data_v10(code)`，必须画图。"
+    
+    # 铁律指令
+    sys_prompt = f"""
+    你叫“金鑫”，私人财富顾问。当前日期:{datetime.now().strftime('%Y-%m-%d')}。
+    
+    【技术铁律 - 绝对遵守】
+    1. 获取数据必须且只能调用 `get_stock_data_v11(ticker)`。
+    2. **严禁使用 seaborn (sns)**！只允许使用 `matplotlib.pyplot` (plt) 画图。
+    3. 画图代码不要包含 `plt.show()`，不要包含中文注释（防止乱码）。
+    4. 必须画图。
+    
+    【代码模板】
+    df, info = get_stock_data_v11("00700") # 腾讯
+    if df is not None:
+        print(info)
+        plt.figure(figsize=(10, 4))
+        plt.plot(df.index, df['Close'], color='#c2185b')
+        plt.title("Price Trend")
+        plt.grid(True)
+    else:
+        print(f"Error: {{info}}")
+    """
     return genai.GenerativeModel("gemini-3-pro-preview", system_instruction=sys_prompt)
 
 def run_code(code):
     img = None; out = "运行完成"
-    # 清洗代码
+    # 清洗代码：移除 import，防止 AI 再次引入 seaborn
     safe_code = '\n'.join([l for l in code.split('\n') if not l.strip().startswith(('import','from'))])
     
     try:
@@ -135,13 +187,13 @@ def run_code(code):
         capture = io.StringIO()
         with contextlib.redirect_stdout(capture):
             # 注入变量
-            exec(safe_code, globals(), {'get_stock_data_v10':get_stock_data_v10,'plt':plt,'pd':pd,'yf':yf})
+            exec(safe_code, globals(), {'get_stock_data_v11':get_stock_data_v11,'plt':plt,'pd':pd,'yf':yf})
         out = capture.getvalue()
         if plt.get_fignums():
             fn = f"chart_{int(time.time())}.png"
             img = os.path.join(CHARTS_DIR, fn)
             plt.savefig(img, bbox_inches='tight'); plt.close()
-    except Exception as e: out = f"错误: {e}"
+    except Exception as e: out = f"代码执行错误: {e}"
     return img, out
 
 # --- 记忆 ---
@@ -176,6 +228,7 @@ st.markdown("""
     .stApp { background-color: #0e1117; }
     div[data-testid="stSidebar"] img { border-radius: 50%; border: 3px solid #4CAF50; }
     .stChatMessage { background-color: rgba(255,255,255,0.05); }
+    .code-output { background-color: #e8f5e9; color: black !important; padding: 10px; border-radius: 5px; }
     .monitor-box { background:#e3f2fd; color:#1565c0; padding:10px; border-radius:5px; text-align:center; }
 </style>
 """, unsafe_allow_html=True)
@@ -212,11 +265,13 @@ with st.sidebar:
             st.rerun()
         if st.session_state.monitor:
             st.markdown(f"<div class='monitor-box'>监控中...</div>", unsafe_allow_html=True)
-            _, info = get_stock_data_v10(m_code)
+            _, info = get_stock_data_v11(m_code)
             if "现价" in info:
-                curr = float(re.search(r"现价: (\d+\.\d+)", info).group(1))
-                st.metric("现价", curr)
-                if m_price > 0 and curr < m_price: st.error("触发跌破！")
+                try:
+                    curr = float(re.search(r"现价: (\d+\.\d+)", info).group(1))
+                    st.metric("现价", curr)
+                    if m_price > 0 and curr < m_price: st.error("触发跌破！")
+                except: pass
 
     # 功能
     col_clr, col_exp = st.columns(2)
@@ -295,7 +350,6 @@ if st.session_state.messages and st.session_state.messages[-1]["role"] == "user"
                 # 语音
                 af = None
                 try:
-                    # 简化口语生成，防止超时
                     spoken = get_spoken_response(txt[:500]) 
                     if spoken:
                         fn = os.path.join(AUDIO_DIR, f"v_{int(time.time())}.mp3")
