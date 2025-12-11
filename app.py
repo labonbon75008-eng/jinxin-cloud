@@ -19,7 +19,7 @@ import edge_tts
 import requests
 import pandas as pd
 import warnings
-import contextlib
+import contextlib # ✅ 已修复：补回漏掉的库
 import sys
 import yfinance as yf
 from PIL import Image
@@ -27,11 +27,13 @@ from PIL import Image
 # ================= 1. 云端环境配置 =================
 warnings.filterwarnings("ignore")
 
-# ⚠️ 云端无代理模式
+# ✅ 修复：优先从 Secrets 读取 Key，防止泄露
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except:
-    API_KEY = "AIzaSyAaN5lJUzp7MXQuLyi8NMV5V26aizR8kBU" 
+    # 如果没配置 Secrets，为了防止报错，提示用户
+    st.error("请在 Streamlit Settings -> Secrets 中配置 GEMINI_API_KEY")
+    st.stop()
 
 MEMORY_FILE = "investment_memory_cloud.json"
 CHARTS_DIR = "charts"
@@ -47,23 +49,22 @@ st.markdown("""
 <style>
     .stApp { background-color: #0e1117; }
     
-    /* 侧边栏头像圆形化 */
+    /* 侧边栏头像美化 */
     div[data-testid="stSidebar"] img {
-        border-radius: 50%;
-        border: 2px solid #4CAF50;
+        border-radius: 15px;
+        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
     
-    /* 隐藏顶部默认头像，只显示我们自定义的 */
-    div[data-testid="stHeader"] { display: none; }
-    
+    /* 顶部标题区头像 */
+    .header-avatar img {
+        border-radius: 50%;
+        border: 3px solid #4CAF50;
+    }
+
     .stChatMessage { background-color: rgba(255, 255, 255, 0.05); border-radius: 10px; padding: 10px; margin-bottom: 10px; }
     mark { background-color: #ffeb3b; color: #000000 !important; border-radius: 4px; padding: 0.2em; font-weight: bold; }
-    .current-match { border: 2px solid #ff4b4b; padding: 10px; border-radius: 10px; background-color: rgba(255, 75, 75, 0.05); display: block; }
     .code-output { background-color: #e8f5e9; color: #000000 !important; padding: 15px; border-radius: 8px; border-left: 6px solid #2e7d32; font-family: 'Consolas', monospace; margin-bottom: 10px; font-size: 0.95em; }
     .monitor-box { border: 2px solid #ff5722; background-color: #fff3e0; padding: 10px; border-radius: 10px; text-align: center; color: #d84315; font-weight: bold; font-size: 0.9em; margin-bottom: 10px; }
-    
-    /* 按钮紧凑 */
-    div[data-testid="stButton"] button { white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -109,7 +110,7 @@ def get_stock_data_cloud(ticker_symbol):
             info_str = f"日期: {last_date} | 最新价: {last_price:.2f} {currency}{change_str}"
             return df, info_str
     except Exception as e: print(f"Yahoo Error: {e}")
-    return None, f"无法获取 {symbol} 数据，请检查代码"
+    return None, f"无法获取 {symbol} 数据"
 
 # --- 语音合成 ---
 async def generate_audio_edge(text, output_file):
@@ -149,7 +150,7 @@ SYSTEM_INSTRUCTION = f"""
 
 【能力】
 查询价格时，请编写代码调用 `get_stock_data_cloud(ticker)`。
-A股代码直接写数字 (如 600309)。
+A股代码直接写数字 (如 600309)，美股直接写代码 (如 AAPL)。
 
 【代码模板】
 ticker = "300750" # 宁德时代
@@ -170,7 +171,7 @@ def get_model():
     genai.configure(api_key=API_KEY)
     return genai.GenerativeModel(model_name="gemini-3-pro-preview", system_instruction=SYSTEM_INSTRUCTION)
 
-# --- 基础 CRUD (保留完整功能) ---
+# --- 基础 CRUD ---
 def load_memory():
     if os.path.exists(MEMORY_FILE):
         try:
@@ -243,19 +244,19 @@ if "last_search_query" not in st.session_state: st.session_state.last_search_que
 if "trigger_scroll" not in st.session_state: st.session_state.trigger_scroll = False
 if "monitor_active" not in st.session_state: st.session_state.monitor_active = False
 
+# 头像逻辑
+user_avatar = load_avatar("user", "👨‍💼")
+ai_avatar = load_avatar("avatar", "👩‍💼")
+
 # --- 侧边栏 ---
 with st.sidebar:
-    user_avatar = load_avatar("user", "👨‍💼")
-    ai_avatar = load_avatar("avatar", "👩‍💼")
-    
-    # 强制只显示自定义头像
-    c_av1, c_av2, c_av3 = st.columns([1, 2, 1])
-    with c_av2:
-        if os.path.exists("avatar.png"): st.image("avatar.png", use_container_width=True)
-        else: st.markdown("<div style='text-align: center; font-size: 60px;'>👩‍💼</div>", unsafe_allow_html=True)
-    st.markdown("<h3 style='text-align: center;'>金鑫 - 云端版</h3>", unsafe_allow_html=True)
+    if os.path.exists(ai_avatar) and ai_avatar != "👩‍💼": 
+        st.image(ai_avatar, use_container_width=True)
+    else: 
+        st.markdown("<div style='text-align: center; font-size: 60px;'>👩‍💼</div>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align: center;'>金鑫 - 云端合伙人</h3>", unsafe_allow_html=True)
 
-    # 1. 盯盘 (回归!)
+    # 1. 盯盘 (功能回归)
     with st.expander("🎯 价格雷达 (盯盘)", expanded=False):
         monitor_ticker = st.text_input("代码", value="300750", placeholder="如 300750")
         c_m1, c_m2 = st.columns(2)
@@ -272,21 +273,19 @@ with st.sidebar:
             if df_m is not None:
                 curr = df_m['Close'].iloc[-1]
                 st.metric("实时价", f"{curr:.2f}")
-                
                 triggered = False
                 if monitor_type == "跌破" and curr < monitor_target: triggered = True
                 if monitor_type == "突破" and curr > monitor_target: triggered = True
-                
                 if triggered:
                     msg = f"注意！{monitor_ticker} 现价 {curr:.2f} 触发目标！"
                     st.error(msg)
-                    st.session_state.monitor_active = False
+                    st.session_state.monitor_active = False 
             else:
                 st.warning("获取失败")
 
     st.divider()
     
-    # 2. 搜索 (回归!)
+    # 2. 搜索 (功能回归)
     search_query = st.text_input("🔍 搜索", placeholder="关键词...", label_visibility="collapsed")
     match_indices = [i for i, m in enumerate(st.session_state.messages) if not m.get("hidden", False) and search_query and search_query in m["content"]]
     if search_query != st.session_state.last_search_query:
@@ -305,7 +304,7 @@ with st.sidebar:
 
     st.divider()
     
-    # 3. 导出与清空 (回归!)
+    # 3. 导出与清空 (功能回归)
     c_btn1, c_btn2 = st.columns(2)
     if c_btn1.button("🗑️ 清空", type="primary", use_container_width=True):
         st.session_state.messages = []; st.session_state.chat_session = None
@@ -318,8 +317,16 @@ with st.sidebar:
     st.divider()
     text_voice = mic_recorder(start_prompt="🎙️ 语音", stop_prompt="⏹️ 停止", key='rec', format="wav", use_container_width=True)
 
-# Main
-st.markdown("<h2 style='text-align: center;'>👩‍💼 金鑫：云端财富合伙人</h2>", unsafe_allow_html=True)
+# --- 主界面 ---
+# ✅ 修复：头部显示金鑫头像，而非丑表情
+c_head1, c_head2 = st.columns([1, 6])
+with c_head1:
+    if os.path.exists(ai_avatar) and ai_avatar != "👩‍💼":
+        st.image(ai_avatar, width=80)
+    else:
+        st.markdown("## 👩‍💼")
+with c_head2:
+    st.markdown("## 金鑫：云端财富合伙人")
 
 for i, msg in enumerate(st.session_state.messages):
     if msg.get("hidden", False): continue
@@ -346,7 +353,7 @@ for i, msg in enumerate(st.session_state.messages):
         if msg.get("image_path") and os.path.exists(msg["image_path"]): st.image(msg["image_path"])
         if msg.get("audio_path") and os.path.exists(msg.get("audio_path")): st.audio(msg["audio_path"], format="audio/wav")
         
-        # 【功能回归】操作菜单
+        # ✅ 修复：操作按钮回归
         with st.expander("🛠️ 更多操作", expanded=False):
             c1, c2, c3 = st.columns([1,1,3])
             if c1.button("🚫 隐藏", key=f"h_{msg['id']}"): toggle_hidden(msg["id"])
