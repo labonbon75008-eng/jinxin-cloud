@@ -1,9 +1,8 @@
 import streamlit as st
 import google.generativeai as genai
 import os
-# 【关键】强制非交互式后端，防止云端画图卡死
 import matplotlib
-matplotlib.use('Agg') 
+matplotlib.use('Agg') # 强制非交互后端，防止云端崩溃
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from docx import Document
@@ -43,8 +42,8 @@ for d in [CHARTS_DIR, AUDIO_DIR]:
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except:
-    st.error("🚨 严重错误：未配置 API Key！请去 Streamlit Secrets 填写。")
-    st.stop()
+    # 兼容本地测试，但在云端必须配置 Secrets
+    API_KEY = "AIzaSyAaN5lJUzp7MXQuLyi8NMV5V26aizR8kBU"
 
 # ================= 2. 核心功能函数 =================
 
@@ -68,7 +67,7 @@ def get_sina_code(symbol):
     return f"sh{s}" if s.isdigit() else s
 
 def get_stock_data_v8(ticker_symbol):
-    """极速数据引擎：保证绝对返回 DataFrame，防止报错"""
+    """极速数据引擎"""
     sina_code = get_sina_code(ticker_symbol)
     info_str = "暂无数据"
     current_price = 0.0
@@ -82,11 +81,12 @@ def get_stock_data_v8(ticker_symbol):
             parts = r.text.split('"')[1].split(',')
             name = parts[0]
             current_price = float(parts[3])
+            # 兼容不同市场的时间格式
             date_time = datetime.now().strftime("%H:%M:%S")
             info_str = f"【{name}】 现价: {current_price} | 时间: {date_time}"
     except: pass
 
-    # 2. 抓历史K线
+    # 2. 抓历史K线 (Yahoo)
     df = None
     try:
         y_sym = ticker_symbol.upper()
@@ -101,12 +101,11 @@ def get_stock_data_v8(ticker_symbol):
             df = hist[['Close']]
     except: pass
 
-    # 【兜底修复】如果没拿到历史数据，但拿到了现价，手动造一个数据，保证画图不崩！
+    # 兜底：防止画图报错
     if df is None and current_price > 0:
         df = pd.DataFrame({'Close': [current_price, current_price]}, 
                           index=[datetime.now()-timedelta(days=1), datetime.now()])
     
-    # 彻底兜底：如果啥都没拿到，返回 None，但也返回错误信息
     return df, info_str
 
 # --- 语音与 AI ---
@@ -138,7 +137,7 @@ def get_spoken_response(text_analysis):
         return response.text
     except: return ""
 
-# --- 模型配置 ---
+# --- 模型配置 (强化指令，防止幻觉) ---
 def configure_chinese_font():
     font_candidates = [r"C:\Windows\Fonts\msyh.ttc", r"C:\Windows\Fonts\simhei.ttf"]
     for path in font_candidates:
@@ -153,17 +152,17 @@ current_time_str = datetime.now().strftime("%Y年%m月%d日")
 SYSTEM_INSTRUCTION = f"""
 你叫“金鑫”，用户的专属私人财富合伙人。当前日期：{current_time_str}。
 
-【任务】
-1. 必须调用 `get_stock_data_v8(ticker)` 获取数据。
-2. A股代码直接写数字 (如 600309)。
-3. 必须在最后画图。
+【绝对规则】
+1. **禁止导入任何外部库**（如 import tools, import sklearn 等）。
+2. **直接使用** `get_stock_data_v8(ticker)` 获取数据。
+3. **直接使用** `plt` 画图，不要重新导入 matplotlib。
 
 【代码模板】
 ticker = "300750" 
 df, info = get_stock_data_v8(ticker)
 
 if df is not None:
-    print(info) # 打印实时信息
+    print(info) 
     plt.figure(figsize=(10, 5))
     plt.plot(df.index, df['Close'], label='Close', color='#c2185b') 
     plt.title(f"{{ticker}} Trend")
@@ -177,16 +176,25 @@ def get_model():
     genai.configure(api_key=API_KEY)
     return genai.GenerativeModel(model_name="gemini-3-pro-preview", system_instruction=SYSTEM_INSTRUCTION)
 
-# --- E. 代码执行引擎 (修复 plt 报错) ---
+# --- E. 代码执行引擎 (终极防御：清洗代码) ---
 def execute_local_code_and_save(code_str):
     image_path = None; text_output = ""; output_capture = io.StringIO()
+    
+    # 【清洗】强制删除所有 import 语句，防止 AI 乱导包
+    clean_lines = []
+    for line in code_str.split('\n'):
+        if line.strip().startswith("import ") or line.strip().startswith("from "):
+            continue # 跳过导入语句
+        clean_lines.append(line)
+    safe_code = "\n".join(clean_lines)
+
     try:
-        # 每次画图前清理画布，防止重叠
+        # 清理画布
         plt.close('all') 
         plt.clf()
         plt.figure(figsize=(10, 5), dpi=100) 
         
-        # 注入所有工具
+        # 注入环境
         local_vars = {
             'get_stock_data_v8': get_stock_data_v8,
             'plt': plt, 
@@ -195,7 +203,7 @@ def execute_local_code_and_save(code_str):
         }
         
         with contextlib.redirect_stdout(output_capture):
-            exec(code_str, globals(), local_vars)
+            exec(safe_code, globals(), local_vars)
             
         text_output = output_capture.getvalue()
         
@@ -211,7 +219,7 @@ def execute_local_code_and_save(code_str):
     
     return image_path, text_output
 
-# --- F. 记忆管理 (脏数据清洗) ---
+# --- F. 记忆管理 ---
 def load_memory():
     data = []
     if os.path.exists(MEMORY_FILE):
@@ -220,7 +228,6 @@ def load_memory():
                 raw = json.load(f)
                 if isinstance(raw, list):
                     for item in raw:
-                        # 【核心修复】只保留格式正确的记录，坏记录直接丢弃
                         if isinstance(item, dict) and "role" in item and "content" in item:
                             data.append(item)
         except: pass
@@ -270,7 +277,7 @@ st.markdown("""
 
 # 状态初始化
 if "messages" not in st.session_state: st.session_state.messages = load_memory()
-if "last_audio_id" not in st.session_state: st.session_state.last_audio_id = None # 【关键】防止语音死循环
+if "last_audio_id" not in st.session_state: st.session_state.last_audio_id = None
 
 if "chat_session" not in st.session_state:
     try:
@@ -359,7 +366,6 @@ with st.sidebar:
     c_btn2.download_button("📥 导出", doc, "报告.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
     
     st.divider()
-    # 语音输入
     audio_val = mic_recorder(start_prompt="🎙️ 语音提问", stop_prompt="⏹️ 停止", key='mic')
 
 # --- 主界面 ---
@@ -402,13 +408,10 @@ for i, msg in enumerate(st.session_state.messages):
             if c2.button("🗑️ 删除", key=f"d_{msg.get('id')}"): delete_message(msg.get("id"))
             st.code(clean, language="text")
 
-# 输入处理
 u_in_text = st.chat_input("请问金鑫...")
 u_in = None
 
-# 【核心修复】防止语音死循环逻辑
 if audio_val and audio_val['bytes']: 
-    # 只有当这次的 ID 和上次不一样，才处理
     if audio_val['id'] != st.session_state.last_audio_id:
         st.session_state.last_audio_id = audio_val['id']
         u_in = transcribe_audio(audio_val['bytes'])
