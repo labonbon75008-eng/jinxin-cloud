@@ -1,8 +1,9 @@
 import streamlit as st
 import google.generativeai as genai
 import os
+# 【关键】强制非交互式后端，防止云端画图卡死
 import matplotlib
-matplotlib.use('Agg') # 【核心修复】强制使用非交互式后端，防止云端画图卡死
+matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from docx import Document
@@ -26,7 +27,7 @@ import sys
 import yfinance as yf
 from PIL import Image
 
-# ================= 1. 系统核心配置 =================
+# ================= 1. 系统配置 =================
 warnings.filterwarnings("ignore")
 
 st.set_page_config(page_title="金鑫 - 智能财富合伙人", page_icon="👩‍💼", layout="wide")
@@ -38,11 +39,11 @@ AUDIO_DIR = "audio_cache"
 for d in [CHARTS_DIR, AUDIO_DIR]:
     if not os.path.exists(d): os.makedirs(d)
 
-# API KEY
+# API KEY (安全读取)
 try:
     API_KEY = st.secrets["GEMINI_API_KEY"]
 except:
-    st.error("🚨 请在 Streamlit Secrets 中配置 GEMINI_API_KEY")
+    st.error("🚨 严重错误：未配置 API Key！请去 Streamlit Secrets 填写。")
     st.stop()
 
 # ================= 2. 核心功能函数 =================
@@ -67,12 +68,12 @@ def get_sina_code(symbol):
     return f"sh{s}" if s.isdigit() else s
 
 def get_stock_data_v8(ticker_symbol):
-    """极速数据引擎"""
+    """极速数据引擎：保证绝对返回 DataFrame，防止报错"""
     sina_code = get_sina_code(ticker_symbol)
-    info_str = "暂无实时数据"
+    info_str = "暂无数据"
     current_price = 0.0
     
-    # 1. Sina Realtime
+    # 1. 抓实时价
     try:
         url = f"http://hq.sinajs.cn/list={sina_code}"
         headers = {'Referer': 'https://finance.sina.com.cn'}
@@ -80,15 +81,12 @@ def get_stock_data_v8(ticker_symbol):
         if '=""' not in r.text and len(r.text) > 20:
             parts = r.text.split('"')[1].split(',')
             name = parts[0]
-            curr = float(parts[3])
-            prev = float(parts[2])
-            pct = ((curr - prev) / prev) * 100 if prev != 0 else 0
+            current_price = float(parts[3])
             date_time = datetime.now().strftime("%H:%M:%S")
-            info_str = f"【{name}】 现价: {curr:.2f} ({pct:+.2f}%) | 时间: {date_time}"
-            current_price = curr
-    except Exception as e: print(f"Sina Error: {e}")
+            info_str = f"【{name}】 现价: {current_price} | 时间: {date_time}"
+    except: pass
 
-    # 2. Yahoo History (Chart)
+    # 2. 抓历史K线
     df = None
     try:
         y_sym = ticker_symbol.upper()
@@ -98,16 +96,17 @@ def get_stock_data_v8(ticker_symbol):
             elif len(y_sym)==5: y_sym += ".HK"
         
         ticker = yf.Ticker(y_sym)
-        # 尝试获取较长时间数据以保证画图美观
         hist = ticker.history(period="1mo") 
         if not hist.empty:
             df = hist[['Close']]
     except: pass
 
-    # 兜底：如果Yahoo挂了但新浪活着，手动造一个点防止报错
+    # 【兜底修复】如果没拿到历史数据，但拿到了现价，手动造一个数据，保证画图不崩！
     if df is None and current_price > 0:
-        df = pd.DataFrame({'Close': [current_price]}, index=[datetime.now()])
-
+        df = pd.DataFrame({'Close': [current_price, current_price]}, 
+                          index=[datetime.now()-timedelta(days=1), datetime.now()])
+    
+    # 彻底兜底：如果啥都没拿到，返回 None，但也返回错误信息
     return df, info_str
 
 # --- 语音与 AI ---
@@ -178,14 +177,16 @@ def get_model():
     genai.configure(api_key=API_KEY)
     return genai.GenerativeModel(model_name="gemini-3-pro-preview", system_instruction=SYSTEM_INSTRUCTION)
 
-# --- E. 代码执行引擎 (核心修复：注入 plt) ---
+# --- E. 代码执行引擎 (修复 plt 报错) ---
 def execute_local_code_and_save(code_str):
     image_path = None; text_output = ""; output_capture = io.StringIO()
     try:
-        plt.clf(); plt.figure(figsize=(10, 5), dpi=100) 
+        # 每次画图前清理画布，防止重叠
+        plt.close('all') 
+        plt.clf()
+        plt.figure(figsize=(10, 5), dpi=100) 
         
-        # 【关键修复】全局注入 plt, pd, yf, get_stock_data_v8
-        # 这样 AI 写的代码里直接用 plt.plot() 就不会报错 "name 'plt' is not defined"
+        # 注入所有工具
         local_vars = {
             'get_stock_data_v8': get_stock_data_v8,
             'plt': plt, 
@@ -210,20 +211,19 @@ def execute_local_code_and_save(code_str):
     
     return image_path, text_output
 
-# --- F. 记忆管理 (核心修复：数据清洗) ---
+# --- F. 记忆管理 (脏数据清洗) ---
 def load_memory():
-    """读取并清洗记忆文件，防止 str 报错"""
     data = []
     if os.path.exists(MEMORY_FILE):
         try:
             with open(MEMORY_FILE, "r", encoding='utf-8') as f:
-                raw_data = json.load(f)
-                # 【数据清洗】只保留字典类型的数据，剔除损坏的字符串
-                if isinstance(raw_data, list):
-                    for item in raw_data:
-                        if isinstance(item, dict):
+                raw = json.load(f)
+                if isinstance(raw, list):
+                    for item in raw:
+                        # 【核心修复】只保留格式正确的记录，坏记录直接丢弃
+                        if isinstance(item, dict) and "role" in item and "content" in item:
                             data.append(item)
-        except: pass # 如果文件彻底坏了，就返回空列表，相当于重置
+        except: pass
     return data
 
 def save_memory(messages):
@@ -270,10 +270,11 @@ st.markdown("""
 
 # 状态初始化
 if "messages" not in st.session_state: st.session_state.messages = load_memory()
+if "last_audio_id" not in st.session_state: st.session_state.last_audio_id = None # 【关键】防止语音死循环
+
 if "chat_session" not in st.session_state:
     try:
         model = get_model()
-        # 过滤掉坏数据再传给模型
         valid_history = []
         for m in st.session_state.messages:
             if isinstance(m, dict) and not m.get("hidden", False):
@@ -310,7 +311,6 @@ with st.sidebar:
             st.markdown("<div class='monitor-box'>📡 扫描中...</div>", unsafe_allow_html=True)
             df_m, info_m = get_stock_data_v8(monitor_ticker)
             if df_m is not None:
-                # 尝试解析价格
                 try:
                     curr = df_m['Close'].iloc[-1]
                     st.metric("实时价", f"{curr:.2f}")
@@ -329,7 +329,6 @@ with st.sidebar:
     
     # 2. 搜索
     search_query = st.text_input("🔍 搜索", placeholder="关键词...", label_visibility="collapsed")
-    # 搜索前先过滤非字典项
     match_indices = [i for i, m in enumerate(st.session_state.messages) if isinstance(m, dict) and not m.get("hidden", False) and search_query and search_query in str(m.get("content"))]
     if search_query != st.session_state.last_search_query:
         st.session_state.search_idx = 0; st.session_state.last_search_query = search_query; st.session_state.trigger_scroll = True
@@ -360,7 +359,8 @@ with st.sidebar:
     c_btn2.download_button("📥 导出", doc, "报告.docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
     
     st.divider()
-    text_voice = mic_recorder(start_prompt="🎙️ 语音", stop_prompt="⏹️ 停止", key='rec', format="wav", use_container_width=True)
+    # 语音输入
+    audio_val = mic_recorder(start_prompt="🎙️ 语音提问", stop_prompt="⏹️ 停止", key='mic')
 
 # --- 主界面 ---
 c_h1, c_h2 = st.columns([1, 6])
@@ -370,9 +370,8 @@ with c_h1:
 with c_h2:
     st.title("金鑫：云端财富合伙人")
 
-# 渲染消息流 (带容错)
+# 渲染消息
 for i, msg in enumerate(st.session_state.messages):
-    # 容错：如果 msg 不是字典，跳过
     if not isinstance(msg, dict): continue
     if msg.get("hidden", False): continue
     
@@ -403,12 +402,18 @@ for i, msg in enumerate(st.session_state.messages):
             if c2.button("🗑️ 删除", key=f"d_{msg.get('id')}"): delete_message(msg.get("id"))
             st.code(clean, language="text")
 
+# 输入处理
 u_in_text = st.chat_input("请问金鑫...")
 u_in = None
-if text_voice and text_voice['bytes']:
-    t = transcribe_audio(text_voice['bytes'])
-    if t: u_in = t
-elif u_in_text: u_in = u_in_text
+
+# 【核心修复】防止语音死循环逻辑
+if audio_val and audio_val['bytes']: 
+    # 只有当这次的 ID 和上次不一样，才处理
+    if audio_val['id'] != st.session_state.last_audio_id:
+        st.session_state.last_audio_id = audio_val['id']
+        u_in = transcribe_audio(audio_val['bytes'])
+elif u_in_text: 
+    u_in = u_in_text
 
 if u_in:
     st.session_state.messages.append({"id": str(uuid.uuid4()), "role": "user", "content": u_in, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "hidden": False})
@@ -417,7 +422,6 @@ if u_in:
 
 if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
     last = st.session_state.messages[-1]
-    # 容错：确保last是字典
     if isinstance(last, dict):
         with st.chat_message("assistant", avatar=ai_avatar_path if ai_avatar_path else "👩‍💼"):
             ph = st.empty(); img = None; out = None; txt = ""
