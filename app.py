@@ -6,20 +6,20 @@ import uuid
 import re
 import io
 import asyncio
-import base64
 import requests
 import pandas as pd
 import warnings
 import contextlib
 import matplotlib
-# 1. 强制后台绘图，防止云端崩溃
+# 1. 强制后台绘图
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import yfinance as yf
 from docx import Document
+from datetime import datetime
 
-# 【核心修复1】语音组件防崩导入：如果环境不支持，直接跳过，绝不报错卡死
+# 语音组件防崩
 try:
     from streamlit_mic_recorder import mic_recorder
 except ImportError:
@@ -28,41 +28,31 @@ except ImportError:
 import edge_tts
 import speech_recognition as sr
 import google.generativeai as genai
-from datetime import datetime
-from PIL import Image
 
 # ================= 1. 系统配置 =================
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="金鑫 - 投资助理", page_icon="👩‍💼", layout="wide")
 
-# CSS 强制手机端优化 (针对截图问题的修复)
+# CSS 优化
 st.markdown("""
 <style>
-    /* 强制操作区不换行，允许横向滑动 */
-    div[data-testid="stHorizontalBlock"] { 
-        flex-wrap: nowrap !important; 
-        overflow-x: auto !important; 
-    }
-    div[data-testid="stHorizontalBlock"] button { 
-        min-width: 60px !important; 
-        padding: 0px 5px !important; 
-        white-space: nowrap !important;
-    }
+    /* 手机端按钮强制一行 */
+    div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; overflow-x: auto !important; }
+    div[data-testid="stHorizontalBlock"] button { min-width: 60px !important; padding: 0px 5px !important; }
     .main-title { text-align: center; font-size: 26px; font-weight: bold; color: white; margin-bottom: 10px; }
-    .avatar-img { width: 120px; height: 120px; border-radius: 50%; border: 3px solid #4CAF50; margin: 0 auto; display: block; object-fit: cover; }
-    /* 隐藏不必要的全屏按钮 */
+    /* 隐藏全屏按钮 */
     button[title="View fullscreen"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
 # 核心路径
-MEMORY_FILE = "investment_memory_v20.json"
+MEMORY_FILE = "investment_memory_v22.json"
 CHARTS_DIR = "charts"
 AUDIO_DIR = "audio_cache"
 FONT_PATH = "SimHei.ttf" 
 
 for d in [CHARTS_DIR, AUDIO_DIR]:
-    os.makedirs(d, exist_ok=True)
+    if not os.path.exists(d): os.makedirs(d)
 
 # API KEY
 try:
@@ -70,18 +60,26 @@ try:
 except:
     API_KEY = "AIzaSyAaN5lJUzp7MXQuLyi8NMV5V26aizR8kBU"
 
-# ================= 2. 静态资源 =================
+# ================= 2. 静态资源 (HTML 渲染版) =================
 
-# 【核心修复2】头像硬编码，防止 NameError，防止白板
-DEFAULT_AVATAR = "[https://api.dicebear.com/9.x/avataaars/png?seed=Jinxin&clothing=blazerAndShirt&hairColor=black&skinColor=light&accessories=glasses&top=longHairStraight](https://api.dicebear.com/9.x/avataaars/png?seed=Jinxin&clothing=blazerAndShirt&hairColor=black&skinColor=light&accessories=glasses&top=longHairStraight)"
+# 稳定的 PNG 头像链接
+AVATAR_URL = "https://api.dicebear.com/9.x/avataaars/png?seed=Jinxin&clothing=blazerAndShirt&hairColor=black&skinColor=light&accessories=glasses&top=longHairStraight"
 
-def get_avatar():
-    return DEFAULT_AVATAR
+def render_avatar():
+    """使用 HTML 直接渲染头像，绕过 st.image 的文件权限问题"""
+    return f"""
+    <div style="display: flex; justify-content: center; margin-bottom: 20px;">
+        <img src="{AVATAR_URL}" style="width:120px; height:120px; border-radius:50%; border:3px solid #4CAF50; object-fit:cover;">
+    </div>
+    """
+
+def get_avatar_url():
+    return AVATAR_URL
 
 def check_font():
     if not os.path.exists(FONT_PATH):
         try:
-            r = requests.get("[https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf](https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf)")
+            r = requests.get("https://github.com/StellarCN/scp_zh/raw/master/fonts/SimHei.ttf")
             with open(FONT_PATH, "wb") as f: f.write(r.content)
         except: pass
     if os.path.exists(FONT_PATH):
@@ -93,9 +91,7 @@ check_font()
 # ================= 3. 核心业务逻辑 =================
 
 def clean_text_display(text):
-    """【核心修复3】彻底删除代码块，只留文字"""
-    # 删除 ``` ... ``` 之间的所有内容 (包括换行)
-    # 无论有无 python 标签，统统删掉
+    """彻底删除代码块"""
     text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
     return text.strip()
 
@@ -118,8 +114,8 @@ def get_stock_data(user_input):
     
     # Sina
     try:
-        url = f"[http://hq.sinajs.cn/list=](http://hq.sinajs.cn/list=){sina_code}"
-        r = requests.get(url, headers={'Referer':'[https://finance.sina.com.cn](https://finance.sina.com.cn)'}, timeout=2)
+        url = f"http://hq.sinajs.cn/list={sina_code}"
+        r = requests.get(url, headers={'Referer':'https://finance.sina.com.cn'}, timeout=2)
         if len(r.text) > 20:
             parts = r.text.split('"')[1].split(',')
             if len(parts) > 3:
@@ -158,7 +154,6 @@ def get_model():
 
 def execute_code(code_str):
     img_path = None; capture = io.StringIO()
-    # 强制不显示图表弹窗
     safe_code = code_str.replace("plt.show()", "# plt.show()")
     lines = [l for l in safe_code.split('\n') if not l.strip().startswith(('import','from'))]
     safe_code = '\n'.join(lines)
@@ -236,7 +231,8 @@ if "sess" not in st.session_state or st.session_state.sess is None:
 
 # --- 侧边栏 ---
 with st.sidebar:
-    st.image(get_avatar(), width=120)
+    # 侧边栏头像直接用 st.image，这里一般不会报错
+    st.image(AVATAR_URL, width=120)
     st.markdown("<h3 style='text-align:center'>金鑫</h3>", unsafe_allow_html=True)
     
     with st.expander("🎯 盯盘", expanded=True):
@@ -273,17 +269,19 @@ with st.sidebar:
 
 # --- 主界面 ---
 st.markdown("<div class='main-title'>你的投资助理</div>", unsafe_allow_html=True)
-st.markdown(f"<div style='display:flex;justify-content:center;margin-bottom:20px;'><img src='{get_avatar()}' class='avatar-img'></div>", unsafe_allow_html=True)
+# 【核心修复】HTML 渲染头像，解决 MediaFileStorageError
+st.markdown(render_avatar(), unsafe_allow_html=True)
 
 # --- 消息渲染 ---
 for i, msg in enumerate(st.session_state.messages):
     if msg.get("hidden"): continue
     if search and search not in str(msg['content']): continue
 
-    av = get_avatar() if msg["role"] == "assistant" else "👨‍💼"
+    # 头像地址传给 chat_message，如果是网络地址通常没问题，如果不行就用 emoji
+    av = AVATAR_URL if msg["role"] == "assistant" else "👨‍💼"
     
     with st.chat_message(msg["role"], avatar=av):
-        # 1. 文本 (已清洗，不显示代码)
+        # 1. 文本 (已清洗)
         st.markdown(clean_text_display(msg["content"]))
         
         # 2. 图片
@@ -295,7 +293,6 @@ for i, msg in enumerate(st.session_state.messages):
             st.audio(msg["audio_path"])
             
         with st.expander("⋮ 操作"):
-            # 强制等宽布局
             c1, c2, c3, c4 = st.columns([1,1,1,1])
             if c1.button("📋", key=f"cp_{i}", help="复制"): st.code(clean_text_display(msg["content"]))
             if c2.button("🙈", key=f"hd_{i}", help="隐藏"): 
@@ -304,11 +301,10 @@ for i, msg in enumerate(st.session_state.messages):
                 del st.session_state.messages[i]; save_mem(st.session_state.messages); st.rerun()
             c4.download_button("📥", create_doc(st.session_state.messages, i), f"msg_{i}.docx", key=f"ex_{i}", help="导出")
 
-# --- 输入处理 (防崩核心) ---
+# --- 输入处理 ---
 st.markdown("---")
 c_voice, c_text = st.columns([1, 5])
 
-# 语音组件 (加防爆盾：如果 mic_recorder 没加载成功，直接跳过，不崩)
 user_input = None
 if mic_recorder:
     with c_voice:
@@ -321,24 +317,20 @@ if mic_recorder:
                         user_input = transcribe(audio_val['bytes'])
                         if not user_input: st.toast("未检测到语音")
         except: 
-            st.caption("语音不可用") # 降级处理
+            st.caption("语音不可用")
 
-# 文字组件 (放在外层，确保永远显示)
 text_input = st.chat_input("请输入问题...")
 if text_input: user_input = text_input
 
 if user_input:
-    # 记录
     st.session_state.messages.append({"role": "user", "content": user_input, "id": str(uuid.uuid4())})
     save_mem(st.session_state.messages)
     
-    # 回答
-    with st.chat_message("assistant", avatar=get_avatar()):
+    with st.chat_message("assistant", avatar=AVATAR_URL):
         with st.spinner("思考中..."):
             try:
                 if not st.session_state.sess: st.rerun()
                 
-                # 提示词注入
                 _, real_info = get_stock_data(user_input[:10])
                 sys_prompt = f"""
                 当前时间：{datetime.now().strftime('%Y-%m-%d')}。
@@ -352,15 +344,12 @@ if user_input:
                 resp = st.session_state.sess.send_message(sys_prompt)
                 txt = resp.text
                 
-                # 执行代码 + 清洗
-                img_p = None
+                img_p = None; out_t = None
                 codes = re.findall(r'```python(.*?)```', txt, re.DOTALL)
                 if codes: img_p = execute_code(codes[-1])
                 
-                # 清洗后的文本 (不含代码)
                 clean_txt = clean_text_display(txt)
                 
-                # 语音生成
                 af = None
                 spoken = get_voice_res(clean_txt[:500])
                 if spoken:
@@ -369,7 +358,7 @@ if user_input:
                 
                 st.session_state.messages.append({
                     "role": "assistant", 
-                    "content": clean_txt, # 只存清洗后的文本
+                    "content": clean_txt, 
                     "id": str(uuid.uuid4()),
                     "image_path": img_p, 
                     "audio_path": af
