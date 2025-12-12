@@ -22,15 +22,62 @@ from streamlit_mic_recorder import mic_recorder
 import edge_tts
 import speech_recognition as sr
 import google.generativeai as genai
-# 【核心修复】显式导入 datetime
 from datetime import datetime
 
-# ================= 1. 系统核心配置 =================
+# ================= 1. 系统配置 =================
 warnings.filterwarnings("ignore")
 st.set_page_config(page_title="金鑫 - 投资助理", page_icon="👩‍💼", layout="wide")
 
+# 强制手机端按钮不换行 (CSS 黑科技)
+st.markdown("""
+<style>
+    /* 强制操作区的列不换行，且允许左右滑动 */
+    div[data-testid="column"] {
+        display: flex;
+        flex-direction: column;
+    }
+    @media (max-width: 640px) {
+        div[data-testid="stHorizontalBlock"] {
+            flex-wrap: nowrap !important;
+            overflow-x: auto !important;
+        }
+        div[data-testid="stHorizontalBlock"] button {
+            white-space: nowrap !important;
+            padding: 0px 10px !important;
+            min-width: 60px !important;
+        }
+    }
+    .stApp { background-color: #0e1117; }
+    /* 头像样式 */
+    .avatar-img { 
+        width: 120px; 
+        height: 120px; 
+        border-radius: 50%; 
+        border: 3px solid #4CAF50; 
+        margin: 0 auto; 
+        display: block; 
+        object-fit: cover;
+    }
+    .main-title { 
+        text-align: center; 
+        font-size: 26px; 
+        font-weight: bold; 
+        color: white; 
+        margin-bottom: 15px; 
+    }
+    .code-output { 
+        background-color: #e8f5e9; 
+        color: black !important; 
+        padding: 10px; 
+        border-radius: 5px; 
+        font-family: monospace; 
+        font-size: 0.9em;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # 核心路径
-MEMORY_FILE = "investment_memory_v16.json"
+MEMORY_FILE = "investment_memory_v17.json"
 CHARTS_DIR = "charts"
 AUDIO_DIR = "audio_cache"
 FONT_PATH = "SimHei.ttf" 
@@ -44,24 +91,18 @@ try:
 except:
     API_KEY = "AIzaSyAaN5lJUzp7MXQuLyi8NMV5V26aizR8kBU"
 
-# ================= 2. 静态资源内嵌 (彻底解决头像白框) =================
-# 内嵌一个SVG头像数据的Base64，确保绝对能显示，不再依赖文件
-# 这是一个职业女性的矢量图
-DEFAULT_AVATAR_B64 = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjAgMTIwIiBmaWxsPSJub25lIj48Y2lyY2xlIGN4PSI2MCIgY3k9IjYwIiByPSI2MCIgZmlsbD0iI2UzZjJmZCIvPjxwYXRoIGQ9Ik02MCAyNWMtMTkuMyAwLTM1IDE1LjctMzUgMzVzMTUuNyAzNSAzNSAzNSAzNS0xNS43IDM1LTM1LTE1LjctMzUtMzUtMzV6bTAgMTBjMTMuOCAwIDI1IDExLjIgMjUgMjVzLTExLjIgMjUtMjUgMjUtMjUtMTEuMi0yNS0yNXExMS4yLTI1IDI1LTI1eiIgZmlsbD0iIzE1NjVjMCIvPjxwYXRoIGQ9Ik02MCA4MGMtMTYuNiAwLTMwIDEzLjQtMzAgMzBoNjBjMC0xNi42LTEzLjQtMzAtMzAtMzB6IiBmaWxsPSIjNDU1YTY0Ii8+PC9zdmc+"
+# ================= 2. 静态资源 =================
 
-def get_avatar_image():
-    """优先本地，失败则用内嵌 Base64，保证不白框"""
+# 稳定的网络头像 (职业女性形象)
+DEFAULT_AVATAR = "https://api.dicebear.com/9.x/avataaars/svg?seed=Jinxin&clothing=blazerAndShirt&hairColor=black&skinColor=light&accessories=glasses&top=longHairStraight"
+
+def get_avatar():
+    """获取头像：优先本地，失败则用网络高清图"""
     for ext in ["png", "jpg", "jpeg"]:
-        if os.path.exists(f"avatar.{ext}"): 
-            try:
-                with open(f"avatar.{ext}", "rb") as f:
-                    return f"data:image/{ext};base64,{base64.b64encode(f.read()).decode()}"
-            except: pass
-    return DEFAULT_AVATAR_B64
+        if os.path.exists(f"avatar.{ext}"): return f"avatar.{ext}"
+    return DEFAULT_AVATAR
 
-# ================= 3. 核心功能函数 =================
-
-# --- A. 字体下载 ---
+# 字体下载
 def check_font():
     if not os.path.exists(FONT_PATH):
         try:
@@ -74,9 +115,20 @@ def check_font():
         plt.rcParams['axes.unicode_minus'] = False
 check_font()
 
-# --- B. 数据引擎 ---
-def get_stock_data(ticker):
-    s = ticker.strip().upper().replace(".SS","").replace(".SZ","").replace(".HK","")
+# ================= 3. 核心业务逻辑 =================
+
+# --- A. 数据引擎 (智能防错版) ---
+def get_stock_data(user_input):
+    # 1. 智能提取代码 (防止传入中文)
+    s = str(user_input).strip().upper()
+    match = re.search(r"[0-9]{4,6}", s)
+    if match:
+        s = match.group()
+    else:
+        # 如果没提取到数字，尝试识别纯英文代码 (如 AAPL)
+        s = re.sub(r'[^A-Z0-9]', '', s)
+
+    # 2. 格式化
     sina_code = s; y_sym = s
     if s.isdigit():
         if len(s)==5: sina_code=f"hk{s}"; y_sym=f"{s}.HK"
@@ -87,7 +139,7 @@ def get_stock_data(ticker):
 
     info_str = "暂无数据"; curr = 0.0
     
-    # Sina
+    # 3. Sina (极速)
     try:
         url = f"http://hq.sinajs.cn/list={sina_code}"
         r = requests.get(url, headers={'Referer':'https://finance.sina.com.cn'}, timeout=2)
@@ -101,7 +153,7 @@ def get_stock_data(ticker):
                 info_str = f"【{name}】 现价: {curr:.2f} ({pct:+.2f}%)"
     except: pass
 
-    # Yahoo
+    # 4. Yahoo (画图)
     df = None
     try:
         tk = yf.Ticker(y_sym)
@@ -109,39 +161,56 @@ def get_stock_data(ticker):
         if not hist.empty: df = hist[['Close']]
     except: pass
 
-    # 兜底
+    # 5. 兜底 (防止 AI 画图报错)
     if df is None and curr > 0:
         df = pd.DataFrame({'Close': [curr]*5}, index=pd.date_range(end=datetime.now(), periods=5))
     
+    # 【关键】返回两个值
     return df, info_str
 
-# --- C. AI 引擎 (修复 sess 报错) ---
+# --- B. AI 引擎 ---
 @st.cache_resource
 def get_model():
     genai.configure(api_key=API_KEY)
-    return genai.GenerativeModel("gemini-3-pro-preview")
-
-def get_chat_session():
-    """每次调用前确保 Session 存在"""
-    if "sess" not in st.session_state or st.session_state.sess is None:
-        model = get_model()
-        h = []
-        for m in st.session_state.get("messages", []):
-            if not m.get("hidden"):
-                h.append({"role":("user" if m["role"]=="user" else "model"), "parts":[str(m["content"])]})
-        st.session_state.sess = model.start_chat(history=h)
-    return st.session_state.sess
+    # 【提示词强化】防止 Tuple Error
+    prompt = f"""
+    你叫“金鑫”，用户的投资助理。当前时间：{datetime.now().strftime('%Y-%m-%d')}。
+    
+    【核心铁律】
+    1. 你调用 `get_stock_data(code)` 会得到 **两个返回值**：`df` 和 `info`。
+    2. 你必须写成： `df, info = get_stock_data("...")` (必须解包！)。
+    3. 必须画图。
+    4. 回答要亲切、自然、像真人聊天。
+    
+    【正确代码示例】
+    df, info = get_stock_data("00700")
+    if df is not None:
+        print(info)
+        plt.figure(figsize=(8, 4))
+        plt.plot(df.index, df['Close'], color='#c2185b')
+        plt.title("Trend")
+        plt.grid(True)
+    else:
+        print(f"Error: {{info}}")
+    """
+    return genai.GenerativeModel("gemini-3-pro-preview", system_instruction=prompt)
 
 def execute_code(code_str):
     img_path = None; output = ""; capture = io.StringIO()
-    safe_code = '\n'.join([l for l in code_str.split('\n') if not l.strip().startswith(('import','from'))])
+    # 自动修正 plt.show
+    safe_code = code_str.replace("plt.show()", "# plt.show()")
+    # 清洗 import
+    lines = [l for l in safe_code.split('\n') if not l.strip().startswith(('import','from'))]
+    safe_code = '\n'.join(lines)
+
     try:
         plt.close('all'); plt.clf(); plt.figure(figsize=(8, 4))
+        # 注入 contextlib 和 datetime
         with contextlib.redirect_stdout(capture):
-            # 【核心修复】注入 datetime 到沙盒
             exec(safe_code, globals(), {
                 'get_stock_data':get_stock_data, 
-                'plt':plt, 'pd':pd, 'yf':yf, 'datetime':datetime
+                'plt':plt, 'pd':pd, 'yf':yf, 'datetime':datetime,
+                'contextlib': contextlib
             })
         output = capture.getvalue()
         if plt.get_fignums():
@@ -151,7 +220,7 @@ def execute_code(code_str):
     except Exception as e: output = f"执行错误: {e}"
     return img_path, output
 
-# --- D. 语音 ---
+# --- C. 语音 ---
 async def gen_voice(text, path):
     try: await edge_tts.Communicate(text, "zh-CN-XiaoxiaoNeural").save(path); return True
     except: return False
@@ -159,7 +228,7 @@ async def gen_voice(text, path):
 def get_voice_res(text):
     try:
         model = genai.GenerativeModel("gemini-3-pro-preview")
-        return model.generate_content(f"你是金鑫，将此内容转为聊天口语(80字内)：\n{text}").text
+        return model.generate_content(f"转为口语(80字内)，像聊天一样自然：\n{text}").text
     except: return ""
 
 def transcribe(audio_bytes):
@@ -169,7 +238,7 @@ def transcribe(audio_bytes):
             return r.recognize_google(r.record(source), language='zh-CN')
     except: return None
 
-# --- E. 记忆与文件 ---
+# --- D. 记忆管理 (每次强制读写) ---
 def load_mem():
     if os.path.exists(MEMORY_FILE):
         try:
@@ -194,25 +263,22 @@ def create_doc(msgs, idx=None):
 
 # ================= 4. 界面布局 =================
 
-st.markdown("""
-<style>
-    .stApp { background-color: #0e1117; }
-    .main-title { text-align: center; font-size: 28px; font-weight: bold; margin-bottom: 5px; color: white; }
-    .avatar-container { display: flex; justify-content: center; margin-bottom: 20px; }
-    .avatar-img { width: 120px; height: 120px; border-radius: 50%; border: 3px solid #4CAF50; object-fit: cover; }
-    div[data-testid="stSidebar"] button { width: 100%; }
-    .code-output { background-color: #e8f5e9; color: #000000 !important; padding: 10px; border-radius: 5px; font-family: monospace; }
-</style>
-""", unsafe_allow_html=True)
-
-# 状态
-if "messages" not in st.session_state: st.session_state.messages = load_mem()
+# 状态 (每次运行强制加载最新记忆，保证同步)
+st.session_state.messages = load_mem()
 if "monitor" not in st.session_state: st.session_state.monitor = False
 if "last_audio" not in st.session_state: st.session_state.last_audio = None
 
+# Session 初始化 (放在所有 UI 之前)
+if "sess" not in st.session_state or st.session_state.sess is None:
+    try:
+        model = get_model()
+        h = [{"role":("user" if m["role"]=="user" else "model"), "parts":[str(m["content"])]} for m in st.session_state.messages if not m.get("hidden")]
+        st.session_state.sess = model.start_chat(history=h)
+    except: pass
+
 # --- 侧边栏 ---
 with st.sidebar:
-    st.markdown(f"<img src='{get_avatar_image()}' style='width:100px; display:block; margin:0 auto; border-radius:50%;'>", unsafe_allow_html=True)
+    st.markdown(f"<img src='{get_avatar()}' style='width:100px; display:block; margin:0 auto; border-radius:50%;'>", unsafe_allow_html=True)
     st.markdown("<h3 style='text-align:center'>金鑫</h3>", unsafe_allow_html=True)
     
     with st.expander("🎯 盯盘", expanded=True):
@@ -223,10 +289,10 @@ with st.sidebar:
             st.rerun()
         if st.session_state.monitor:
             st.info("📡 监控中...")
-            _, info = get_stock_data(m_code)
-            if "现价" in info:
+            df, info = get_stock_data(m_code) # 解包防止报错
+            if "现价" in str(info):
                 try:
-                    curr = float(re.search(r"现价: (\d+\.\d+)", info).group(1))
+                    curr = float(re.search(r"现价: (\d+\.\d+)", str(info)).group(1))
                     st.metric("实时价", curr)
                     if curr < m_tgt: st.error("触发目标价！"); st.session_state.monitor = False
                 except: pass
@@ -249,14 +315,14 @@ with st.sidebar:
 
 # --- 主界面 ---
 st.markdown("<div class='main-title'>你的投资助理</div>", unsafe_allow_html=True)
-st.markdown(f"<div class='avatar-container'><img src='{get_avatar_image()}' class='avatar-img'></div>", unsafe_allow_html=True)
+st.markdown(f"<div class='avatar-container'><img src='{get_avatar()}' class='avatar-img'></div>", unsafe_allow_html=True)
 
 # --- 消息渲染 ---
 for i, msg in enumerate(st.session_state.messages):
     if msg.get("hidden"): continue
     if search and search not in str(msg['content']): continue
 
-    av = get_avatar_image() if msg["role"] == "assistant" else "👨‍💼"
+    av = get_avatar() if msg["role"] == "assistant" else "👨‍💼"
     
     with st.chat_message(msg["role"], avatar=av):
         if msg.get("code_output"): 
@@ -270,6 +336,7 @@ for i, msg in enumerate(st.session_state.messages):
             st.audio(msg["audio_path"])
             
         with st.expander("⋮ 操作"):
+            # 【手机端适配】强制4列
             c1, c2, c3, c4 = st.columns([1,1,1,1])
             if c1.button("📋", key=f"cp_{i}", help="复制"): st.code(msg["content"])
             if c2.button("🙈", key=f"hd_{i}", help="隐藏"): 
@@ -278,7 +345,7 @@ for i, msg in enumerate(st.session_state.messages):
                 del st.session_state.messages[i]; save_mem(st.session_state.messages); st.rerun()
             c4.download_button("📥", create_doc(st.session_state.messages, i), f"msg_{i}.docx", key=f"ex_{i}", help="导出")
 
-# --- 统一输入处理 (修复无响应) ---
+# --- 统一输入处理 (先存后刷，防卡死) ---
 st.markdown("---")
 c_voice, c_text = st.columns([1, 5])
 
@@ -288,6 +355,7 @@ with c_voice:
 user_input = None
 text_input = st.chat_input("请输入问题...")
 
+# 逻辑：优先文字，其次语音
 if text_input:
     user_input = text_input
 elif audio_val and audio_val['bytes']:
@@ -296,22 +364,22 @@ elif audio_val and audio_val['bytes']:
         with st.spinner("识别中..."):
             user_input = transcribe(audio_val['bytes'])
 
+# 1. 存入用户消息 -> 强制刷新
 if user_input:
     st.session_state.messages.append({"role": "user", "content": user_input, "id": str(uuid.uuid4())})
     save_mem(st.session_state.messages)
+    st.rerun() # 立即刷新！确保输入框清空且消息上屏
+
+# 2. 刷新后检查最后一条，如果是用户发的，则触发 AI 回答
+if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+    last_msg = st.session_state.messages[-1]
     
-    with st.chat_message("assistant", avatar=get_avatar_image()):
+    with st.chat_message("assistant", avatar=get_avatar()):
         with st.spinner("👩‍💼 思考中..."):
             try:
-                sess = get_chat_session()
+                if not st.session_state.sess: st.rerun()
                 
-                # 提示词
-                sys = f"""当前时间：{datetime.now().strftime('%Y-%m-%d')}。
-                1. 必须调用 `get_stock_data("{user_input[:10]}")` (自动提取代码)。
-                2. 必须画图 (plt.show()已禁用，直接绘图即可)。
-                3. 回答亲切自然。"""
-                
-                resp = sess.send_message(sys + "\n用户:" + user_input)
+                resp = st.session_state.sess.send_message(last_msg["content"])
                 txt = resp.text
                 
                 img_p = None; out_t = None
